@@ -5,13 +5,23 @@ MCP server exposing scrapedatshi pipeline tools to Claude Desktop and any
 MCP-compatible AI client.
 
 Tools exposed:
-    scrape_url              — Scrape & chunk a single URL
-    crawl_site              — Crawl a whole site (sitemap or spider mode)
-    extract_data            — Extract structured schema from a URL using your LLM
-    extract_crawl           — Multi-page schema extraction via site crawl
-    sync_to_vectordb        — Full pipeline: scrape → embed → inject into vector DB
+    verify_provider_key      — Verify an LLM or embedding API key + get live model list
+    get_usage_guide          — Returns the guided wizard flow Claude should follow
+    scrape_url               — Scrape & chunk a single URL
+    crawl_site               — Crawl a whole site (sitemap or spider mode)
+    extract_data             — Extract structured schema from a URL using your LLM
+    extract_crawl            — Multi-page schema extraction via site crawl
+    sync_to_vectordb         — Full pipeline: scrape → embed → inject into vector DB
     list_embedding_providers — Discover supported embedding providers + required fields
     list_vector_db_providers — Discover supported vector DBs + required fields
+
+Guided Wizard Flow:
+    For any operation requiring an LLM or embedding key, Claude MUST:
+      1. Call verify_provider_key → get live model list for the user's key
+      2. Present models to user, ask them to choose
+      3. Ask if JS rendering is needed (SPA/JS-heavy page)
+      4. Present Contextual Retrieval as a recommended upgrade (improves accuracy 35-50%)
+      5. Call the actual tool with all confirmed parameters
 
 Key Fallback Pattern (secure BYOK):
     Sensitive API keys are resolved in this priority order:
@@ -39,9 +49,9 @@ Run as stdio MCP server (standard for Claude Desktop):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-import sys
 from typing import Any
 
 import mcp.server.stdio
@@ -67,26 +77,351 @@ from scrapedatshi.providers import (
 
 server = Server("scrapedatshi")
 
+# ── Provider model discovery ──────────────────────────────────────────────────
+
+
+async def _discover_openai_llm_models(api_key: str) -> dict:
+    """Discover available OpenAI text generation models."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "openai package not installed. Run: pip install scrapedatshi-mcp[openai]",
+        }
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.models.list()
+        llm_prefixes = ("gpt-", "o1-", "o3-", "o4-", "chatgpt-")
+        models = sorted(
+            [
+                m.id
+                for m in response.data
+                if any(m.id.startswith(p) for p in llm_prefixes)
+            ],
+            reverse=True,
+        )
+        if not models:
+            models = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo"]
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "authentication" in msg.lower() or "api_key" in msg.lower():
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your OpenAI key.",
+            }
+        return {"valid": False, "models": [], "error": f"OpenAI error: {msg[:200]}"}
+
+
+async def _discover_anthropic_llm_models(api_key: str) -> dict:
+    """Discover available Anthropic models via live API."""
+    try:
+        import anthropic
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "anthropic package not installed. Run: pip install scrapedatshi-mcp[anthropic]",
+        }
+    try:
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        response = await client.models.list()
+        models = [m.id for m in response.data if m.id]
+        if not models:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "No models found for this API key.",
+            }
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "authentication" in msg.lower() or "api_key" in msg.lower():
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Anthropic key.",
+            }
+        return {"valid": False, "models": [], "error": f"Anthropic error: {msg[:200]}"}
+
+
+async def _discover_gemini_llm_models(api_key: str) -> dict:
+    """Discover available Gemini text generation models."""
+    try:
+        from google import genai
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "google-genai package not installed. Run: pip install scrapedatshi-mcp[gemini]",
+        }
+    try:
+        client = genai.Client(api_key=api_key)
+
+        def _list():
+            return list(client.models.list())
+
+        all_models = await asyncio.to_thread(_list)
+        EXCLUDE = (
+            "embedding",
+            "imagen",
+            "veo",
+            "lyria",
+            "tts",
+            "audio",
+            "aqa",
+            "robotics",
+            "translate",
+            "live",
+        )
+        llm_models = sorted(
+            set(
+                m.name
+                for m in all_models
+                if not any(kw in m.name.lower() for kw in EXCLUDE)
+                and ("gemini" in m.name.lower() or "gemma" in m.name.lower())
+            ),
+            reverse=True,
+        )
+        if not llm_models:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "No Gemini text generation models found.",
+            }
+        return {"valid": True, "models": llm_models, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "403" in msg or "api_key" in msg.lower():
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Google Gemini key.",
+            }
+        return {"valid": False, "models": [], "error": f"Gemini error: {msg[:200]}"}
+
+
+async def _discover_openai_embed_models(api_key: str) -> dict:
+    """Discover available OpenAI embedding models."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "openai package not installed. Run: pip install scrapedatshi-mcp[openai]",
+        }
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.models.list()
+        models = sorted(
+            [m.id for m in response.data if "embedding" in m.id.lower()], reverse=True
+        )
+        if not models:
+            models = [
+                "text-embedding-3-small",
+                "text-embedding-3-large",
+                "text-embedding-ada-002",
+            ]
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "authentication" in msg.lower():
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your OpenAI key.",
+            }
+        return {"valid": False, "models": [], "error": f"OpenAI error: {msg[:200]}"}
+
+
+async def _discover_cohere_embed_models(api_key: str) -> dict:
+    """Discover available Cohere embedding models."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.cohere.com/v1/models",
+                params={"endpoint": "embed"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                },
+            )
+        if resp.status_code == 401:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Cohere key.",
+            }
+        if resp.status_code != 200:
+            return {
+                "valid": False,
+                "models": [],
+                "error": f"Cohere API error: {resp.status_code}",
+            }
+        data = resp.json()
+        models = [m["name"] for m in data.get("models", []) if m.get("name")]
+        if not models:
+            models = [
+                "embed-english-v3.0",
+                "embed-multilingual-v3.0",
+                "embed-english-light-v3.0",
+            ]
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        return {"valid": False, "models": [], "error": f"Cohere error: {str(e)[:200]}"}
+
+
+async def _discover_gemini_embed_models(api_key: str) -> dict:
+    """Discover available Gemini embedding models."""
+    try:
+        from google import genai
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "google-genai package not installed. Run: pip install scrapedatshi-mcp[gemini]",
+        }
+    try:
+        client = genai.Client(api_key=api_key)
+
+        def _list():
+            return list(client.models.list())
+
+        all_models = await asyncio.to_thread(_list)
+        models = sorted(
+            [m.name for m in all_models if "embedding" in m.name.lower()], reverse=True
+        )
+        if not models:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "No Gemini embedding models found.",
+            }
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "403" in msg:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Google Gemini key.",
+            }
+        return {"valid": False, "models": [], "error": f"Gemini error: {msg[:200]}"}
+
+
+async def _discover_mistral_embed_models(api_key: str) -> dict:
+    """Discover available Mistral embedding models."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.mistral.ai/v1/models",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Accept": "application/json",
+                },
+            )
+        if resp.status_code == 401:
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Mistral key.",
+            }
+        if resp.status_code != 200:
+            return {
+                "valid": False,
+                "models": [],
+                "error": f"Mistral API error: {resp.status_code}",
+            }
+        data = resp.json()
+        models = [
+            m["id"] for m in data.get("data", []) if "embed" in m.get("id", "").lower()
+        ]
+        if not models:
+            models = ["mistral-embed"]
+        return {"valid": True, "models": models, "error": None}
+    except Exception as e:
+        return {"valid": False, "models": [], "error": f"Mistral error: {str(e)[:200]}"}
+
+
+async def _discover_voyage_embed_models(api_key: str) -> dict:
+    """Verify Voyage AI key and return current model catalog."""
+    VOYAGE_MODELS = [
+        "voyage-3",
+        "voyage-3-lite",
+        "voyage-code-3",
+        "voyage-finance-2",
+        "voyage-law-2",
+    ]
+    try:
+        import voyageai
+    except ImportError:
+        return {
+            "valid": False,
+            "models": [],
+            "error": "voyageai package not installed. Run: pip install scrapedatshi-mcp[voyage]",
+        }
+    try:
+
+        def _test():
+            client = voyageai.Client(api_key=api_key)
+            client.embed(["test"], model="voyage-3", input_type="document")
+
+        await asyncio.to_thread(_test)
+        return {"valid": True, "models": VOYAGE_MODELS, "error": None}
+    except Exception as e:
+        msg = str(e)
+        if "401" in msg or "authentication" in msg.lower() or "api_key" in msg.lower():
+            return {
+                "valid": False,
+                "models": [],
+                "error": "Invalid API key. Check your Voyage AI key.",
+            }
+        return {"valid": False, "models": [], "error": f"Voyage AI error: {msg[:200]}"}
+
+
+async def _run_discovery(provider: str, provider_type: str, api_key: str) -> dict:
+    """Dispatch to the correct discovery function."""
+    dispatch = {
+        ("openai", "llm"): _discover_openai_llm_models,
+        ("anthropic", "llm"): _discover_anthropic_llm_models,
+        ("gemini", "llm"): _discover_gemini_llm_models,
+        ("openai", "embedding"): _discover_openai_embed_models,
+        ("cohere", "embedding"): _discover_cohere_embed_models,
+        ("gemini", "embedding"): _discover_gemini_embed_models,
+        ("mistral", "embedding"): _discover_mistral_embed_models,
+        ("voyage", "embedding"): _discover_voyage_embed_models,
+    }
+    fn = dispatch.get((provider.lower(), provider_type.lower()))
+    if fn is None:
+        return {
+            "valid": False,
+            "models": [],
+            "error": f"Unsupported combination: provider='{provider}', type='{provider_type}'. "
+            f"LLM providers: openai, anthropic, gemini. "
+            f"Embedding providers: openai, cohere, gemini, mistral, voyage.",
+        }
+    return await fn(api_key)
+
+
 # ── Key resolution helpers ────────────────────────────────────────────────────
 
 
 def _resolve_scrapedatshi_key() -> str | None:
-    """Resolve the scrapedatshi API key from environment."""
     return os.environ.get("SCRAPEDATSHI_API_KEY")
 
 
 def _resolve_llm_key(arguments: dict, provider: str | None = None) -> str | None:
-    """
-    Resolve an LLM API key using the fallback chain:
-      1. Explicit argument
-      2. Provider-specific env var
-      3. Generic fallback env vars
-    """
     explicit = arguments.get("llm_api_key")
     if explicit:
         return explicit
-
-    # Provider-specific env vars
     provider_env_map = {
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
@@ -96,28 +431,19 @@ def _resolve_llm_key(arguments: dict, provider: str | None = None) -> str | None
         val = os.environ.get(provider_env_map[provider])
         if val:
             return val
-
-    # Generic fallbacks (try all if provider unknown)
     for env_var in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"]:
         val = os.environ.get(env_var)
         if val:
             return val
-
     return None
 
 
 def _resolve_embedding_key(arguments: dict, provider: str | None = None) -> str | None:
-    """
-    Resolve an embedding API key using the fallback chain.
-    Returns empty string for Ollama (no key required).
-    """
     if provider == "ollama":
         return arguments.get("embedding_api_key", "")
-
     explicit = arguments.get("embedding_api_key")
     if explicit:
         return explicit
-
     provider_env_map = {
         "openai": "OPENAI_API_KEY",
         "cohere": "COHERE_API_KEY",
@@ -129,24 +455,15 @@ def _resolve_embedding_key(arguments: dict, provider: str | None = None) -> str 
         val = os.environ.get(provider_env_map[provider])
         if val:
             return val
-
-    # Generic fallbacks
     for env_var in ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY"]:
         val = os.environ.get(env_var)
         if val:
             return val
-
     return None
 
 
 def _resolve_vector_db_config(arguments: dict, vector_db: str) -> dict:
-    """
-    Resolve vector DB config, injecting API keys from env vars where missing.
-    The user-provided vector_db_config dict is merged with env-var fallbacks.
-    """
     config: dict = {}
-
-    # Parse user-provided config (may be a JSON string or already a dict)
     raw_config = arguments.get("vector_db_config", {})
     if isinstance(raw_config, str):
         try:
@@ -156,30 +473,22 @@ def _resolve_vector_db_config(arguments: dict, vector_db: str) -> dict:
     elif isinstance(raw_config, dict):
         config = dict(raw_config)
 
-    # Inject env-var fallbacks for API keys
-    if vector_db == "pinecone":
-        if not config.get("api_key"):
-            env_key = os.environ.get("PINECONE_API_KEY")
-            if env_key:
-                config["api_key"] = env_key
-
-    elif vector_db == "qdrant":
-        if not config.get("api_key"):
-            env_key = os.environ.get("QDRANT_API_KEY")
-            if env_key:
-                config["api_key"] = env_key
-
-    elif vector_db == "weaviate":
-        if not config.get("api_key"):
-            env_key = os.environ.get("WEAVIATE_API_KEY")
-            if env_key:
-                config["api_key"] = env_key
-
+    if vector_db == "pinecone" and not config.get("api_key"):
+        env_key = os.environ.get("PINECONE_API_KEY")
+        if env_key:
+            config["api_key"] = env_key
+    elif vector_db == "qdrant" and not config.get("api_key"):
+        env_key = os.environ.get("QDRANT_API_KEY")
+        if env_key:
+            config["api_key"] = env_key
+    elif vector_db == "weaviate" and not config.get("api_key"):
+        env_key = os.environ.get("WEAVIATE_API_KEY")
+        if env_key:
+            config["api_key"] = env_key
     return config
 
 
 def _get_client() -> ScrapedatshiClient:
-    """Create a ScrapedatshiClient using the resolved API key."""
     api_key = _resolve_scrapedatshi_key()
     if not api_key:
         raise AuthError(
@@ -190,7 +499,6 @@ def _get_client() -> ScrapedatshiClient:
 
 
 def _format_error(exc: Exception) -> str:
-    """Format a scrapedatshi exception into a readable error string for Claude."""
     if isinstance(exc, InsufficientCreditsError):
         return (
             f"❌ Insufficient credits: {exc}\n"
@@ -204,11 +512,17 @@ def _format_error(exc: Exception) -> str:
     if isinstance(exc, ValidationError):
         return f"❌ Validation error: {exc}\nCheck your request parameters."
     if isinstance(exc, RateLimitError):
-        return f"❌ Rate limit exceeded: {exc}\nPlease wait a moment and try again."
+        return (
+            f"❌ Rate limit reached: {exc}\n"
+            "Do NOT retry automatically. Inform the user and wait for their instruction before trying again."
+        )
     if isinstance(exc, ServerBusyError):
         retry = getattr(exc, "retry_after", None)
-        wait_msg = f" Retry after {retry} seconds." if retry else ""
-        return f"❌ Server temporarily at capacity: {exc}.{wait_msg}"
+        wait_msg = f" Suggested wait: {retry} seconds." if retry else ""
+        return (
+            f"❌ Server temporarily at capacity: {exc}.{wait_msg}\n"
+            "Inform the user and ask if they'd like to retry after waiting."
+        )
     if isinstance(exc, ScrapedatshiError):
         return f"❌ scrapedatshi API error: {exc}"
     return f"❌ Unexpected error: {exc}"
@@ -216,36 +530,108 @@ def _format_error(exc: Exception) -> str:
 
 # ── Tool definitions ──────────────────────────────────────────────────────────
 
+_PREFLIGHT_NOTE = (
+    "\n\n📋 PRE-FLIGHT REQUIRED — before calling this tool:\n"
+    "1. Call verify_provider_key with the user's provider + key → get live model list\n"
+    "2. Present the model list and ask the user to choose one\n"
+    "3. Ask: 'Is this a JavaScript-heavy page or single-page app (SPA)?' → sets js_render\n"
+    "4. Present Contextual Retrieval as a recommended upgrade: 'Would you like to enable "
+    "Contextual Retrieval (RAG 2.0)? It uses your LLM to enrich each chunk with context, "
+    "improving retrieval accuracy by 35–50%. Recommended for production RAG pipelines. "
+    "Costs ~$0.001/chunk extra.' → sets contextual_retrieval\n"
+    "5. Then call this tool with all confirmed parameters."
+)
+
 
 @server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
+        # ── verify_provider_key ───────────────────────────────────────────────
+        types.Tool(
+            name="verify_provider_key",
+            description=(
+                "Verify an LLM or embedding API key and return the live list of models "
+                "available for that key. Call this BEFORE any operation that requires an "
+                "LLM or embedding provider — never assume or hardcode model names.\n\n"
+                "Returns: key validity, list of available model names (live from the provider's API), "
+                "and an error message if the key is invalid.\n\n"
+                "Supported LLM providers: openai, anthropic, gemini\n"
+                "Supported embedding providers: openai, cohere, gemini, mistral, voyage\n\n"
+                "The API key can be omitted if the corresponding env var is set "
+                "(OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, COHERE_API_KEY, "
+                "MISTRAL_API_KEY, VOYAGE_API_KEY)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "provider": {
+                        "type": "string",
+                        "description": "Provider to verify. LLM: 'openai', 'anthropic', 'gemini'. Embedding: 'openai', 'cohere', 'gemini', 'mistral', 'voyage'.",
+                        "enum": [
+                            "openai",
+                            "anthropic",
+                            "gemini",
+                            "cohere",
+                            "mistral",
+                            "voyage",
+                        ],
+                    },
+                    "provider_type": {
+                        "type": "string",
+                        "description": "'llm' for text generation models (used in extract_data, extract_crawl, contextual_retrieval). 'embedding' for vector embedding models (used in sync_to_vectordb).",
+                        "enum": ["llm", "embedding"],
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "The API key to verify. Can be omitted if the corresponding env var is set.",
+                    },
+                },
+                "required": ["provider", "provider_type"],
+            },
+        ),
+        # ── get_usage_guide ───────────────────────────────────────────────────
+        types.Tool(
+            name="get_usage_guide",
+            description=(
+                "Returns the complete guided workflow for using scrapedatshi tools. "
+                "Call this at the start of any scrapedatshi conversation to understand "
+                "which tool to use for each task and the required pre-flight sequence."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
         # ── scrape_url ────────────────────────────────────────────────────────
         types.Tool(
             name="scrape_url",
             description=(
                 "Scrape a single web URL, chunk its content into RAG-ready text segments, "
-                "and return the structured chunks as JSON. No embedding or vector DB required — "
-                "this is the fastest and cheapest operation. Use this when the user wants to "
-                "read, summarize, or process the content of a specific web page.\n\n"
-                "Supports optional CSS selectors to target specific page sections, JavaScript "
-                "rendering for SPAs, and Contextual Retrieval (RAG 2.0) for enriched chunks.\n\n"
-                "LLM keys (llm_api_key) can be omitted if OPENAI_API_KEY, ANTHROPIC_API_KEY, "
-                "or GEMINI_API_KEY is set in the MCP environment config."
+                "and return the structured chunks. No embedding or vector DB required — "
+                "this is the fastest and cheapest operation.\n\n"
+                "Use this when the user wants to read, summarize, or process the content "
+                "of a specific web page WITHOUT extracting structured fields.\n\n"
+                "If contextual_retrieval=true is requested, follow the PRE-FLIGHT sequence:\n"
+                "1. Call verify_provider_key(provider, 'llm') → get live model list\n"
+                "2. Ask user to choose a model from the list\n"
+                "3. Ask: 'Is this a JavaScript-heavy page or SPA?' → js_render\n"
+                "4. Present Contextual Retrieval as a recommended upgrade: 'Would you like "
+                "Contextual Retrieval (RAG 2.0)? It enriches each chunk with LLM-generated "
+                "context, improving retrieval accuracy by 35–50%. Costs ~$0.001/chunk extra.'\n\n"
+                "LLM keys can be omitted if OPENAI_API_KEY, ANTHROPIC_API_KEY, or "
+                "GEMINI_API_KEY is set in the MCP environment config."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The web URL to scrape and chunk (e.g. 'https://docs.example.com/intro').",
+                        "description": "The web URL to scrape and chunk.",
                     },
                     "selector": {
                         "type": "string",
-                        "description": (
-                            "Optional CSS selector to target a specific element on the page "
-                            "(e.g. 'article', '.content', 'main'). Omit to scrape the full page."
-                        ),
+                        "description": "Optional CSS selector to target a specific element (e.g. 'article', '.content', 'main').",
                     },
                     "chunk_size": {
                         "type": "integer",
@@ -263,36 +649,26 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "js_render": {
                         "type": "boolean",
-                        "description": (
-                            "If true, uses a headless Chromium browser to render JavaScript before "
-                            "scraping. Required for SPAs and JS-heavy pages. Adds a small surcharge."
-                        ),
+                        "description": "Use headless Chromium to render JavaScript before scraping. Required for SPAs and JS-heavy pages. Ask the user before enabling. Adds a small surcharge.",
                         "default": False,
                     },
                     "contextual_retrieval": {
                         "type": "boolean",
-                        "description": (
-                            "Enable RAG 2.0 contextual enrichment. An LLM generates a unique context "
-                            "string for each chunk, boosting retrieval accuracy by 35–50%. "
-                            "Requires llm_provider, llm_api_key, and llm_model."
-                        ),
+                        "description": "Enable RAG 2.0 contextual enrichment. An LLM generates a unique context string for each chunk, boosting retrieval accuracy by 35–50%. Present this as a recommended upgrade. Requires llm_provider and llm_model (from verify_provider_key).",
                         "default": False,
                     },
                     "llm_provider": {
                         "type": "string",
-                        "description": "LLM provider for contextual retrieval. One of: 'openai', 'anthropic', 'gemini'.",
+                        "description": "LLM provider for contextual retrieval. One of: 'openai', 'anthropic', 'gemini'. Verify with verify_provider_key first.",
                         "enum": ["openai", "anthropic", "gemini"],
                     },
                     "llm_api_key": {
                         "type": "string",
-                        "description": (
-                            "API key for the LLM provider. Can be omitted if the corresponding "
-                            "env var is set (OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY)."
-                        ),
+                        "description": "API key for the LLM provider. Can be omitted if set as env var.",
                     },
                     "llm_model": {
                         "type": "string",
-                        "description": "LLM model name (e.g. 'gpt-4o-mini', 'claude-3-haiku-20240307', 'gemini-1.5-flash').",
+                        "description": "LLM model name. MUST be chosen from the list returned by verify_provider_key — do not guess or hardcode.",
                     },
                 },
                 "required": ["url"],
@@ -304,37 +680,35 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Crawl an entire website, chunk all pages, and return structured JSON chunks. "
                 "Two modes: 'sitemap' (reads sitemap.xml — best for docs/blogs) and 'spider' "
-                "(follows links — works on any site). Returns chunks from all crawled pages combined.\n\n"
-                "⚠️ IMPORTANT: This tool processes multiple pages sequentially. Always confirm the "
-                "max_pages limit with the user before calling. Default is 10 pages. For large-scale "
-                "crawls, explicitly prompt the user to define a target limit to avoid unexpected "
-                "credit usage. Maximum allowed: 200 pages.\n\n"
-                "LLM keys can be omitted if set as environment variables in the MCP config."
+                "(follows links — works on any site).\n\n"
+                "Use this when the user wants chunks from MULTIPLE pages WITHOUT extracting "
+                "structured fields. For structured field extraction across pages, use extract_crawl.\n\n"
+                "⚠️ ALWAYS confirm the max_pages limit with the user before calling. "
+                "Default is 10 pages. For large sites, warn about credit usage first.\n\n"
+                "If contextual_retrieval is requested, follow the PRE-FLIGHT sequence:\n"
+                "1. Call verify_provider_key(provider, 'llm') → get live model list\n"
+                "2. Ask user to choose a model\n"
+                "3. Ask about JS rendering\n"
+                "4. Present Contextual Retrieval as a recommended upgrade\n\n"
+                "LLM keys can be omitted if set as environment variables."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The root domain or sitemap URL to crawl (e.g. 'https://docs.example.com').",
+                        "description": "The root domain or sitemap URL to crawl.",
                     },
                     "max_pages": {
                         "type": "integer",
-                        "description": (
-                            "Maximum number of pages to crawl. Default: 10. Maximum: 200. "
-                            "Always confirm this with the user for large sites."
-                        ),
+                        "description": "Maximum pages to crawl. Default: 10. Maximum: 200. Always confirm with user for large sites.",
                         "default": 10,
                         "minimum": 1,
                         "maximum": 200,
                     },
                     "crawl_mode": {
                         "type": "string",
-                        "description": (
-                            "'sitemap' (default): reads sitemap.xml to discover URLs — best for "
-                            "documentation sites and blogs. 'spider': follows <a href> links from "
-                            "the root URL — works on any site, no sitemap required."
-                        ),
+                        "description": "'sitemap': reads sitemap.xml (best for docs/blogs). 'spider': follows links from root URL (works on any site).",
                         "enum": ["sitemap", "spider"],
                         "default": "sitemap",
                     },
@@ -352,26 +726,26 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "js_render": {
                         "type": "boolean",
-                        "description": "Use headless browser to render JS before scraping each page. Adds surcharge per page.",
+                        "description": "Use headless browser to render JS before scraping each page. Ask the user before enabling. Adds surcharge per page.",
                         "default": False,
                     },
                     "contextual_retrieval": {
                         "type": "boolean",
-                        "description": "Enable RAG 2.0 contextual enrichment for all chunks. Requires llm_provider and llm_api_key.",
+                        "description": "Enable RAG 2.0 contextual enrichment. Present as a recommended upgrade. Requires llm_provider and llm_model from verify_provider_key.",
                         "default": False,
                     },
                     "llm_provider": {
                         "type": "string",
-                        "description": "LLM provider for contextual retrieval. One of: 'openai', 'anthropic', 'gemini'.",
+                        "description": "LLM provider for contextual retrieval. Verify with verify_provider_key first.",
                         "enum": ["openai", "anthropic", "gemini"],
                     },
                     "llm_api_key": {
                         "type": "string",
-                        "description": "API key for the LLM provider. Can be omitted if set as an env var.",
+                        "description": "API key for the LLM provider. Can be omitted if set as env var.",
                     },
                     "llm_model": {
                         "type": "string",
-                        "description": "LLM model name for contextual retrieval.",
+                        "description": "LLM model name from verify_provider_key. Do not guess or hardcode.",
                     },
                 },
                 "required": ["url"],
@@ -381,15 +755,17 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="extract_data",
             description=(
-                "Scrape a URL and extract structured data matching a user-defined schema using "
-                "an LLM. The user brings their own LLM key — scrapedatshi handles the scraping "
-                "and orchestration. Returns a JSON object (or array if extract_as_list=true) "
-                "matching the schema fields.\n\n"
-                "Use this when the user wants to pull specific fields from a web page "
-                "(e.g. product title, price, description from an e-commerce page; article "
-                "author, date, summary from a news page).\n\n"
-                "LLM keys can be omitted if OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY "
-                "is set in the MCP environment config."
+                "Scrape a URL and extract structured data matching a user-defined schema "
+                "using an LLM. Returns a JSON object (or array if extract_as_list=true).\n\n"
+                "Use this when the user wants specific FIELDS from a page "
+                "(e.g. product name, price, stock status; article author, date, summary).\n\n"
+                "PRE-FLIGHT REQUIRED — before calling:\n"
+                "1. Call verify_provider_key(provider, 'llm') → get live model list\n"
+                "2. Present models to user, ask them to choose one\n"
+                "3. Ask: 'Is this a JavaScript-heavy page or SPA?' → js_render\n"
+                "4. Present Contextual Retrieval is NOT applicable here (extraction only)\n\n"
+                "LLM keys can be omitted if OPENAI_API_KEY, ANTHROPIC_API_KEY, or "
+                "GEMINI_API_KEY is set in the MCP environment config."
             ),
             inputSchema={
                 "type": "object",
@@ -401,32 +777,23 @@ async def list_tools() -> list[types.Tool]:
                     "schema": {
                         "type": "object",
                         "description": (
-                            "Dict mapping field names to description strings. The LLM uses these "
-                            "descriptions to understand what to extract. "
+                            "Dict mapping field names to description strings. "
                             'Example: {"title": "string — the product name", "price": "number — price in USD", "in_stock": "boolean — whether in stock"}'
                         ),
                         "additionalProperties": {"type": "string"},
                     },
                     "llm_provider": {
                         "type": "string",
-                        "description": "LLM provider to use. One of: 'openai', 'anthropic', 'gemini'.",
+                        "description": "LLM provider. One of: 'openai', 'anthropic', 'gemini'. Call verify_provider_key first.",
                         "enum": ["openai", "anthropic", "gemini"],
                     },
                     "llm_api_key": {
                         "type": "string",
-                        "description": (
-                            "API key for the LLM provider. Can be omitted if the corresponding "
-                            "env var is set (OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY)."
-                        ),
+                        "description": "API key for the LLM provider. Can be omitted if set as env var.",
                     },
                     "llm_model": {
                         "type": "string",
-                        "description": (
-                            "Optional model override. Defaults: openai→gpt-4o-mini, "
-                            "anthropic→claude-3-haiku-20240307, gemini→gemini-1.5-flash. "
-                            "Use an advanced model (gpt-4o, claude-3-5-sonnet, gemini-1.5-pro) "
-                            "for long-form pages like documentation or legal docs."
-                        ),
+                        "description": "LLM model name from verify_provider_key. Do not guess or hardcode. Use an advanced model (not mini/flash/haiku) for long-form pages like documentation or legal docs.",
                     },
                     "selector": {
                         "type": "string",
@@ -434,15 +801,12 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "extract_as_list": {
                         "type": "boolean",
-                        "description": (
-                            "If true, extracts ALL matching items on the page as a JSON array. "
-                            "Use for listing pages (product catalogues, article feeds, search results)."
-                        ),
+                        "description": "If true, extracts ALL matching items on the page as a JSON array. Use for listing pages (product catalogues, article feeds).",
                         "default": False,
                     },
                     "js_render": {
                         "type": "boolean",
-                        "description": "Use headless browser to render JS before extracting. Required for SPAs.",
+                        "description": "Use headless browser to render JS before extracting. Ask the user before enabling.",
                         "default": False,
                     },
                     "click_selector": {
@@ -458,21 +822,25 @@ async def list_tools() -> list[types.Tool]:
             name="extract_crawl",
             description=(
                 "Crawl a domain and extract structured data from every page using your LLM. "
-                "Combines site crawling with schema extraction in a single call. Each page is "
-                "processed independently — failed pages return an error without aborting the batch. "
-                "Only successfully extracted pages are billed.\n\n"
-                "⚠️ IMPORTANT: Each page takes 5–15 seconds to process. Default is 5 pages. "
-                "For more than 20 pages, warn the user about potential wait times and credit usage "
-                "before proceeding. Always confirm the max_pages limit with the user for large sites. "
-                "Maximum: 50 pages per call.\n\n"
-                "LLM keys can be omitted if set as environment variables in the MCP config."
+                "Each page is processed independently — failed pages return an error without "
+                "aborting the batch. Only successfully extracted pages are billed.\n\n"
+                "Use this when the user wants structured FIELDS from MULTIPLE pages "
+                "(e.g. extract title + price from every product page on a site).\n\n"
+                "⚠️ Each page takes 5–15 seconds. Default is 5 pages. For more than 20 pages, "
+                "warn the user about wait times and credit usage before proceeding.\n\n"
+                "PRE-FLIGHT REQUIRED — before calling:\n"
+                "1. Call verify_provider_key(provider, 'llm') → get live model list\n"
+                "2. Present models to user, ask them to choose one\n"
+                "3. Ask: 'Is this a JavaScript-heavy site?' → js_render (not available for extract_crawl, note this)\n"
+                "4. Confirm max_pages with the user\n\n"
+                "LLM keys can be omitted if set as environment variables."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "The root domain to crawl (e.g. 'https://example.com/products').",
+                        "description": "The root domain to crawl.",
                     },
                     "schema": {
                         "type": "object",
@@ -484,33 +852,26 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "llm_provider": {
                         "type": "string",
-                        "description": "LLM provider to use. One of: 'openai', 'anthropic', 'gemini'.",
+                        "description": "LLM provider. One of: 'openai', 'anthropic', 'gemini'. Call verify_provider_key first.",
                         "enum": ["openai", "anthropic", "gemini"],
                     },
                     "llm_api_key": {
                         "type": "string",
-                        "description": "API key for the LLM provider. Can be omitted if set as an env var.",
+                        "description": "API key for the LLM provider. Can be omitted if set as env var.",
                     },
                     "llm_model": {
                         "type": "string",
-                        "description": (
-                            "Optional model override. Standard models (mini/flash/haiku) use 8k char context. "
-                            "Advanced models use 30k char context — better for long pages."
-                        ),
+                        "description": "LLM model name from verify_provider_key. Do not guess or hardcode. Advanced models (not mini/flash/haiku) use 30k char context — better for long pages.",
                     },
                     "crawl_mode": {
                         "type": "string",
-                        "description": "'sitemap' (default): reads sitemap.xml. 'spider': follows links from root URL.",
+                        "description": "'sitemap': reads sitemap.xml. 'spider': follows links from root URL.",
                         "enum": ["sitemap", "spider"],
                         "default": "sitemap",
                     },
                     "max_pages": {
                         "type": "integer",
-                        "description": (
-                            "Maximum pages to crawl and extract from. Default: 5. Maximum: 50. "
-                            "Sitemap mode supports up to 100 pages; spider mode up to 25 pages. "
-                            "Always confirm with the user before setting above 20."
-                        ),
+                        "description": "Maximum pages to crawl and extract. Default: 5. Maximum: 50. Always confirm with user before setting above 20.",
                         "default": 5,
                         "minimum": 1,
                         "maximum": 50,
@@ -540,16 +901,22 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="sync_to_vectordb",
             description=(
-                "Full RAG pipeline: scrape a URL, embed the chunks using your embedding provider, "
-                "and inject the vectors into your vector database — all in a single call. "
-                "Use this when the user wants to add web content to their vector DB for later retrieval.\n\n"
-                "The user brings their own embedding provider key and vector DB credentials. "
-                "scrapedatshi handles the scraping, chunking, embedding orchestration, and injection.\n\n"
-                "To discover supported embedding providers and their required fields, call "
-                "list_embedding_providers first. To discover supported vector DBs and their "
-                "required config fields, call list_vector_db_providers first.\n\n"
-                "Keys can be omitted if set as environment variables (e.g. OPENAI_API_KEY, "
-                "PINECONE_API_KEY) in the MCP config."
+                "Full RAG pipeline: scrape a URL, embed the chunks using your embedding "
+                "provider, and inject the vectors into your vector database — all in one call.\n\n"
+                "Use this when the user wants to ADD web content to their vector DB for "
+                "later retrieval. The user brings their own embedding provider and vector DB.\n\n"
+                "PRE-FLIGHT REQUIRED — before calling:\n"
+                "1. Call verify_provider_key(embedding_provider, 'embedding') → get live embedding model list\n"
+                "2. Present models to user, ask them to choose one\n"
+                "3. Call list_vector_db_providers if user is unsure what config fields are needed\n"
+                "4. Ask: 'Is this a JavaScript-heavy page or SPA?' → js_render\n"
+                "5. Present Contextual Retrieval as a recommended upgrade: 'Would you like "
+                "Contextual Retrieval (RAG 2.0)? It enriches each chunk with LLM-generated "
+                "context before embedding, improving retrieval accuracy by 35–50%. "
+                "Costs ~$0.001/chunk extra. If yes, I'll also need your LLM provider and model.'\n"
+                "6. If contextual_retrieval=yes: call verify_provider_key(llm_provider, 'llm') too\n\n"
+                "Keys can be omitted if set as environment variables (OPENAI_API_KEY, "
+                "PINECONE_API_KEY, etc.)."
             ),
             inputSchema={
                 "type": "object",
@@ -560,10 +927,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "embedding_provider": {
                         "type": "string",
-                        "description": (
-                            "Embedding provider key. Supported: 'openai', 'cohere', 'gemini', "
-                            "'mistral', 'voyage', 'ollama'. Call list_embedding_providers for details."
-                        ),
+                        "description": "Embedding provider. Call verify_provider_key(provider, 'embedding') first to get available models.",
                         "enum": [
                             "openai",
                             "cohere",
@@ -575,35 +939,19 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "embedding_model": {
                         "type": "string",
-                        "description": (
-                            "Model name for the embedding provider. Required for all providers. "
-                            "Examples: openai→'text-embedding-3-small', cohere→'embed-english-v3.0', "
-                            "gemini→'text-embedding-004', mistral→'mistral-embed', "
-                            "voyage→'voyage-3', ollama→'nomic-embed-text'."
-                        ),
+                        "description": "Embedding model name from verify_provider_key. Do not guess or hardcode.",
                     },
                     "embedding_api_key": {
                         "type": "string",
-                        "description": (
-                            "API key for the embedding provider. Can be omitted if the corresponding "
-                            "env var is set (OPENAI_API_KEY, COHERE_API_KEY, GEMINI_API_KEY, etc.). "
-                            "Pass empty string for Ollama (no key required)."
-                        ),
+                        "description": "API key for the embedding provider. Can be omitted if set as env var.",
                     },
                     "embedding_endpoint": {
                         "type": "string",
-                        "description": (
-                            "Public HTTPS endpoint for Ollama only. Must be publicly accessible — "
-                            "use ngrok to expose your local Ollama: 'ngrok http 11434'."
-                        ),
+                        "description": "Public HTTPS endpoint for Ollama only (e.g. from ngrok). Not needed for cloud providers.",
                     },
                     "vector_db": {
                         "type": "string",
-                        "description": (
-                            "Vector DB provider key. Supported: 'pinecone', 'qdrant', 'chroma', "
-                            "'supabase', 'weaviate', 'mongodb', 'azure_cosmos', 'azure_cosmos_mongo', "
-                            "'lancedb'. Call list_vector_db_providers for required config fields."
-                        ),
+                        "description": "Vector DB provider. Call list_vector_db_providers to see required config fields for each.",
                         "enum": [
                             "pinecone",
                             "qdrant",
@@ -619,15 +967,12 @@ async def list_tools() -> list[types.Tool]:
                     "vector_db_config": {
                         "type": "object",
                         "description": (
-                            "Provider-specific configuration dict. Required fields vary by provider. "
-                            "Call list_vector_db_providers to see required fields for each provider. "
-                            "API keys within this config can be omitted if set as env vars "
-                            "(PINECONE_API_KEY, QDRANT_API_KEY, WEAVIATE_API_KEY). "
-                            "Examples:\n"
-                            '  pinecone: {"index_host": "https://my-index.svc.pinecone.io"}\n'
-                            '  qdrant: {"url": "https://cluster.qdrant.io", "collection_name": "docs"}\n'
-                            '  supabase: {"connection_string": "postgresql://...", "table_name": "documents"}\n'
-                            '  chroma: {"collection_name": "docs"}'
+                            "Provider-specific config. Call list_vector_db_providers for required fields. "
+                            "API keys within this config can be omitted if set as env vars. "
+                            'Examples: pinecone: {"index_host": "https://my-index.svc.pinecone.io"} | '
+                            'qdrant: {"url": "https://cluster.qdrant.io", "collection_name": "docs"} | '
+                            'supabase: {"connection_string": "postgresql://...", "table_name": "documents"} | '
+                            'chroma: {"collection_name": "docs"}'
                         ),
                         "additionalProperties": True,
                     },
@@ -651,26 +996,26 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "js_render": {
                         "type": "boolean",
-                        "description": "Use headless browser to render JS before scraping.",
+                        "description": "Use headless browser to render JS before scraping. Ask the user before enabling.",
                         "default": False,
                     },
                     "contextual_retrieval": {
                         "type": "boolean",
-                        "description": "Enable RAG 2.0 contextual enrichment. Requires llm_provider and llm_api_key.",
+                        "description": "Enable RAG 2.0 contextual enrichment before embedding. Present as a recommended upgrade. Requires llm_provider and llm_model.",
                         "default": False,
                     },
                     "llm_provider": {
                         "type": "string",
-                        "description": "LLM provider for contextual retrieval. One of: 'openai', 'anthropic', 'gemini'.",
+                        "description": "LLM provider for contextual retrieval. Verify with verify_provider_key(provider, 'llm') first.",
                         "enum": ["openai", "anthropic", "gemini"],
                     },
                     "llm_api_key": {
                         "type": "string",
-                        "description": "API key for the LLM provider. Can be omitted if set as an env var.",
+                        "description": "API key for the LLM provider. Can be omitted if set as env var.",
                     },
                     "llm_model": {
                         "type": "string",
-                        "description": "LLM model name for contextual retrieval.",
+                        "description": "LLM model name from verify_provider_key. Do not guess or hardcode.",
                     },
                 },
                 "required": [
@@ -685,31 +1030,21 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="list_embedding_providers",
             description=(
-                "Returns a list of all supported embedding providers with their labels, "
-                "whether they require an API key, and notes on available models. "
-                "Call this before sync_to_vectordb to help the user choose an embedding provider "
-                "and understand what model names to use."
+                "Returns all supported embedding providers with labels and notes. "
+                "Call this to help the user choose an embedding provider before sync_to_vectordb. "
+                "After the user chooses, call verify_provider_key to get the live model list."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
         # ── list_vector_db_providers ──────────────────────────────────────────
         types.Tool(
             name="list_vector_db_providers",
             description=(
-                "Returns a list of all supported vector database providers with their labels, "
-                "required config fields, optional fields, and setup notes. "
-                "Call this before sync_to_vectordb to help the user understand what "
-                "vector_db_config fields they need to provide for their chosen database."
+                "Returns all supported vector database providers with required config fields, "
+                "optional fields, and setup notes. Call this before sync_to_vectordb to help "
+                "the user understand what vector_db_config fields they need to provide."
             ),
-            inputSchema={
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
+            inputSchema={"type": "object", "properties": {}, "required": []},
         ),
     ]
 
@@ -719,9 +1054,12 @@ async def list_tools() -> list[types.Tool]:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-
     try:
-        if name == "scrape_url":
+        if name == "verify_provider_key":
+            return await _handle_verify_provider_key(arguments)
+        elif name == "get_usage_guide":
+            return _handle_get_usage_guide()
+        elif name == "scrape_url":
             return await _handle_scrape_url(arguments)
         elif name == "crawl_site":
             return await _handle_crawl_site(arguments)
@@ -744,12 +1082,145 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
 # ── Individual tool handlers ──────────────────────────────────────────────────
 
 
+async def _handle_verify_provider_key(arguments: dict) -> list[types.TextContent]:
+    provider = arguments.get("provider", "").lower().strip()
+    provider_type = arguments.get("provider_type", "").lower().strip()
+
+    if not provider:
+        return [types.TextContent(type="text", text="❌ 'provider' is required.")]
+    if not provider_type:
+        return [
+            types.TextContent(
+                type="text",
+                text="❌ 'provider_type' is required. One of: 'llm', 'embedding'.",
+            )
+        ]
+
+    # Resolve API key
+    api_key = arguments.get("api_key")
+    if not api_key:
+        env_map = {
+            "openai": "OPENAI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "cohere": "COHERE_API_KEY",
+            "mistral": "MISTRAL_API_KEY",
+            "voyage": "VOYAGE_API_KEY",
+        }
+        env_var = env_map.get(provider)
+        if env_var:
+            api_key = os.environ.get(env_var)
+        if not api_key:
+            return [
+                types.TextContent(
+                    type="text",
+                    text=(
+                        f"❌ No API key found for '{provider}'. "
+                        f"Pass api_key as an argument, or set {env_var or 'the corresponding env var'} "
+                        "in your MCP environment config."
+                    ),
+                )
+            ]
+
+    result = await _run_discovery(provider, provider_type, api_key)
+
+    if not result["valid"]:
+        return [
+            types.TextContent(
+                type="text",
+                text=f"❌ Key verification failed for {provider} ({provider_type}):\n{result['error']}",
+            )
+        ]
+
+    models = result["models"]
+    lines = [
+        f"✅ Key verified: {provider} ({provider_type})",
+        f"📋 Available models ({len(models)} found):",
+    ]
+    for m in models:
+        lines.append(f"  • {m}")
+    lines.append("\nAsk the user to choose a model from this list before proceeding.")
+
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+def _handle_get_usage_guide() -> list[types.TextContent]:
+    guide = """# scrapedatshi MCP — Usage Guide
+
+## Which tool to use?
+
+| Goal | Tool |
+|---|---|
+| Read/summarize a single web page | `scrape_url` |
+| Get chunks from multiple pages | `crawl_site` |
+| Extract specific fields from one page | `extract_data` |
+| Extract specific fields from many pages | `extract_crawl` |
+| Add web content to a vector DB | `sync_to_vectordb` |
+| Check what embedding providers are available | `list_embedding_providers` |
+| Check what vector DB config fields are needed | `list_vector_db_providers` |
+| Verify an API key + get live model list | `verify_provider_key` |
+
+---
+
+## Pre-flight sequence (for any LLM or embedding operation)
+
+**Always follow this sequence before calling scrape_url (with CR), crawl_site (with CR), extract_data, extract_crawl, or sync_to_vectordb:**
+
+1. **Verify the key** → call `verify_provider_key(provider, provider_type)` to get the live model list
+2. **Present models** → show the list to the user and ask them to choose one
+3. **Ask about JS rendering** → "Is this a JavaScript-heavy page or single-page app (SPA)? If yes, I'll enable JS rendering (adds a small surcharge per page)."
+4. **Present Contextual Retrieval as a recommended upgrade** → "Would you like to enable Contextual Retrieval (RAG 2.0)? It uses your LLM to generate a unique context summary for each chunk before embedding, improving retrieval accuracy by 35–50%. Recommended for production RAG pipelines. Costs ~$0.001/chunk extra."
+5. **Call the tool** with all confirmed parameters
+
+---
+
+## Key rules
+
+- **Never hardcode or guess model names** — always use `verify_provider_key` to get the live list
+- **Always confirm max_pages** with the user before crawl_site or extract_crawl
+- **Do not retry on rate limit errors** — inform the user and wait for their instruction
+- **Contextual Retrieval is a recommended upgrade** — present it as a quality improvement, not just an option
+
+---
+
+## Supported providers
+
+**LLM** (for extract_data, extract_crawl, contextual_retrieval):
+- `openai`, `anthropic`, `gemini`
+
+**Embedding** (for sync_to_vectordb):
+- `openai`, `cohere`, `gemini`, `mistral`, `voyage`, `ollama`
+
+**Vector databases** (for sync_to_vectordb):
+- `pinecone`, `qdrant`, `chroma`, `supabase`, `weaviate`, `mongodb`, `azure_cosmos`, `azure_cosmos_mongo`, `lancedb`
+
+---
+
+## Environment variables (set in claude_desktop_config.json)
+
+```
+SCRAPEDATSHI_API_KEY  — required
+OPENAI_API_KEY        — OpenAI LLM + embedding
+ANTHROPIC_API_KEY     — Anthropic LLM
+GEMINI_API_KEY        — Google Gemini LLM + embedding
+COHERE_API_KEY        — Cohere embedding
+MISTRAL_API_KEY       — Mistral embedding
+VOYAGE_API_KEY        — Voyage AI embedding
+PINECONE_API_KEY      — Pinecone vector DB
+QDRANT_API_KEY        — Qdrant vector DB (optional)
+WEAVIATE_API_KEY      — Weaviate vector DB (optional)
+```
+
+When env vars are set, keys are resolved automatically — users don't need to type them in chat.
+"""
+    return [types.TextContent(type="text", text=guide)]
+
+
 async def _handle_scrape_url(arguments: dict) -> list[types.TextContent]:
     url = arguments.get("url")
     if not url:
         return [types.TextContent(type="text", text="❌ 'url' is required.")]
 
-    # Resolve optional LLM key if contextual retrieval is requested
     contextual_retrieval = arguments.get("contextual_retrieval", False)
     llm_provider = arguments.get("llm_provider")
     llm_api_key = None
@@ -763,6 +1234,17 @@ async def _handle_scrape_url(arguments: dict) -> list[types.TextContent]:
                         "❌ contextual_retrieval=true requires an LLM API key. "
                         "Pass llm_api_key as an argument, or set OPENAI_API_KEY / "
                         "ANTHROPIC_API_KEY / GEMINI_API_KEY in your MCP environment config."
+                    ),
+                )
+            ]
+        if not arguments.get("llm_model"):
+            return [
+                types.TextContent(
+                    type="text",
+                    text=(
+                        "❌ llm_model is required when contextual_retrieval=true. "
+                        "Call verify_provider_key first to get the available model list, "
+                        "then ask the user to choose one."
                     ),
                 )
             ]
@@ -783,7 +1265,6 @@ async def _handle_scrape_url(arguments: dict) -> list[types.TextContent]:
     finally:
         client.close()
 
-    # Format output
     lines = [
         f"✅ Scraped: {result.source}",
         f"📦 Chunks: {result.total_chunks}",
@@ -829,14 +1310,22 @@ async def _handle_crawl_site(arguments: dict) -> list[types.TextContent]:
                     ),
                 )
             ]
-
-    max_pages = arguments.get("max_pages", 10)
+        if not arguments.get("llm_model"):
+            return [
+                types.TextContent(
+                    type="text",
+                    text=(
+                        "❌ llm_model is required when contextual_retrieval=true. "
+                        "Call verify_provider_key first to get the available model list."
+                    ),
+                )
+            ]
 
     client = _get_client()
     try:
         result = client.pipeline.crawl(
             url=url,
-            max_pages=max_pages,
+            max_pages=arguments.get("max_pages", 10),
             crawl_mode=arguments.get("crawl_mode", "sitemap"),
             selector=arguments.get("selector"),
             include_pattern=arguments.get("include_pattern"),
@@ -869,7 +1358,6 @@ async def _handle_crawl_site(arguments: dict) -> list[types.TextContent]:
         lines.append(
             f"\n[Chunk {i} | ~{chunk.token_estimate} tokens]\n{preview}{'...' if len(chunk.content) > 200 else ''}"
         )
-
     if result.total_chunks > 20:
         lines.append(f"\n... and {result.total_chunks - 20} more chunks.")
 
@@ -895,6 +1383,16 @@ async def _handle_extract_data(arguments: dict) -> list[types.TextContent]:
             types.TextContent(
                 type="text",
                 text="❌ 'llm_provider' is required. One of: 'openai', 'anthropic', 'gemini'.",
+            )
+        ]
+    if not arguments.get("llm_model"):
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    "❌ 'llm_model' is required. Call verify_provider_key(provider, 'llm') first "
+                    "to get the live model list, then ask the user to choose one."
+                ),
             )
         ]
 
@@ -967,6 +1465,16 @@ async def _handle_extract_crawl(arguments: dict) -> list[types.TextContent]:
                 text="❌ 'llm_provider' is required. One of: 'openai', 'anthropic', 'gemini'.",
             )
         ]
+    if not arguments.get("llm_model"):
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    "❌ 'llm_model' is required. Call verify_provider_key(provider, 'llm') first "
+                    "to get the live model list, then ask the user to choose one."
+                ),
+            )
+        ]
 
     llm_api_key = _resolve_llm_key(arguments, llm_provider)
     if not llm_api_key:
@@ -981,8 +1489,6 @@ async def _handle_extract_crawl(arguments: dict) -> list[types.TextContent]:
             )
         ]
 
-    max_pages = arguments.get("max_pages", 5)
-
     client = _get_client()
     try:
         result = client.pipeline.extract_crawl(
@@ -992,7 +1498,7 @@ async def _handle_extract_crawl(arguments: dict) -> list[types.TextContent]:
             llm_api_key=llm_api_key,
             llm_model=arguments.get("llm_model"),
             crawl_mode=arguments.get("crawl_mode", "sitemap"),
-            max_pages=max_pages,
+            max_pages=arguments.get("max_pages", 5),
             selector=arguments.get("selector"),
             include_pattern=arguments.get("include_pattern"),
             exclude_pattern=arguments.get("exclude_pattern"),
@@ -1034,18 +1540,27 @@ async def _handle_sync_to_vectordb(arguments: dict) -> list[types.TextContent]:
         return [
             types.TextContent(
                 type="text",
-                text="❌ 'embedding_provider' is required. Call list_embedding_providers to see options.",
+                text="❌ 'embedding_provider' is required. Call list_embedding_providers to see options, then verify_provider_key to get models.",
             )
         ]
     if not vector_db:
         return [
             types.TextContent(
                 type="text",
-                text="❌ 'vector_db' is required. Call list_vector_db_providers to see options.",
+                text="❌ 'vector_db' is required. Call list_vector_db_providers to see options and required config fields.",
+            )
+        ]
+    if not arguments.get("embedding_model") and embedding_provider != "ollama":
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    "❌ 'embedding_model' is required. Call verify_provider_key(embedding_provider, 'embedding') "
+                    "to get the live model list, then ask the user to choose one."
+                ),
             )
         ]
 
-    # Resolve embedding key
     embedding_api_key = _resolve_embedding_key(arguments, embedding_provider)
     if embedding_api_key is None:
         return [
@@ -1060,10 +1575,7 @@ async def _handle_sync_to_vectordb(arguments: dict) -> list[types.TextContent]:
             )
         ]
 
-    # Resolve vector DB config with env-var key injection
     vector_db_config = _resolve_vector_db_config(arguments, vector_db)
-
-    # Validate required fields for the chosen vector DB
     provider_info = VECTOR_DB_PROVIDERS.get(vector_db, {})
     required_fields = provider_info.get("required_fields", [])
     missing = [f for f in required_fields if not vector_db_config.get(f)]
@@ -1073,16 +1585,25 @@ async def _handle_sync_to_vectordb(arguments: dict) -> list[types.TextContent]:
                 type="text",
                 text=(
                     f"❌ Missing required fields for vector DB '{vector_db}': {missing}. "
-                    f"Call list_vector_db_providers for details on required fields."
+                    "Call list_vector_db_providers for details on required fields."
                 ),
             )
         ]
 
-    # Resolve optional LLM key for contextual retrieval
     contextual_retrieval = arguments.get("contextual_retrieval", False)
     llm_provider = arguments.get("llm_provider")
     llm_api_key = None
     if contextual_retrieval:
+        if not arguments.get("llm_model"):
+            return [
+                types.TextContent(
+                    type="text",
+                    text=(
+                        "❌ llm_model is required when contextual_retrieval=true. "
+                        "Call verify_provider_key(llm_provider, 'llm') to get the live model list."
+                    ),
+                )
+            ]
         llm_api_key = _resolve_llm_key(arguments, llm_provider)
         if not llm_api_key:
             return [
@@ -1148,6 +1669,9 @@ def _handle_list_embedding_providers() -> list[types.TextContent]:
         lines.append(f"- Local: {'Yes' if info.get('local') else 'No'}")
         lines.append(f"- Notes: {info['notes']}")
         lines.append("")
+    lines.append(
+        "After choosing a provider, call verify_provider_key(provider, 'embedding') to get the live model list."
+    )
     return [types.TextContent(type="text", text="\n".join(lines))]
 
 
@@ -1168,7 +1692,6 @@ def _handle_list_vector_db_providers() -> list[types.TextContent]:
 
 def main() -> None:
     """Main entry point — runs the MCP server over stdio."""
-    import asyncio
 
     async def _run() -> None:
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
