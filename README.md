@@ -322,12 +322,12 @@ LLM providers periodically deprecate older models. If you see an error like *"Th
 - **Anthropic**: any current `claude-3-5` or `claude-3-7` series model
 
 **Provider model & deprecation pages:**
-- OpenAI: [platform.openai.com/docs/deprecations](https://platform.openai.com/docs/deprecations)
-- Anthropic: [docs.anthropic.com/en/docs/about-claude/models](https://docs.anthropic.com/en/docs/about-claude/models)
-- Google Gemini: [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models)
-- Cohere: [docs.cohere.com/docs/models](https://docs.cohere.com/docs/models)
-- Mistral: [docs.mistral.ai/getting-started/models](https://docs.mistral.ai/getting-started/models/)
-- Voyage AI: [docs.voyageai.com/docs/embeddings](https://docs.voyageai.com/docs/embeddings)
+- OpenAI: <a href="https://platform.openai.com/docs/deprecations" target="_blank" rel="noopener noreferrer">platform.openai.com/docs/deprecations</a>
+- Anthropic: <a href="https://docs.anthropic.com/en/docs/about-claude/models" target="_blank" rel="noopener noreferrer">docs.anthropic.com/en/docs/about-claude/models</a>
+- Google Gemini: <a href="https://ai.google.dev/gemini-api/docs/models" target="_blank" rel="noopener noreferrer">ai.google.dev/gemini-api/docs/models</a>
+- Cohere: <a href="https://docs.cohere.com/docs/models" target="_blank" rel="noopener noreferrer">docs.cohere.com/docs/models</a>
+- Mistral: <a href="https://docs.mistral.ai/getting-started/models/" target="_blank" rel="noopener noreferrer">docs.mistral.ai/getting-started/models</a>
+- Voyage AI: <a href="https://docs.voyageai.com/docs/embeddings" target="_blank" rel="noopener noreferrer">docs.voyageai.com/docs/embeddings</a>
 
 ---
 
