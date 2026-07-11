@@ -523,7 +523,11 @@ def _get_client() -> ScrapedatshiClient:
             "No scrapedatshi API key found. Set SCRAPEDATSHI_API_KEY in your MCP "
             "environment config or pass it explicitly."
         )
-    return ScrapedatshiClient(api_key=api_key)
+    # Fetch mode: "local" (default) = MCP server fetches URLs using its own IP.
+    # Set SCRAPEDATSHI_FETCH_MODE=server in your MCP env config to use our server's
+    # IP instead (billed at 2× the standard per-URL rate).
+    fetch_mode = os.environ.get("SCRAPEDATSHI_FETCH_MODE", "local")
+    return ScrapedatshiClient(api_key=api_key, fetch_mode=fetch_mode)
 
 
 def _format_error(exc: Exception) -> str:

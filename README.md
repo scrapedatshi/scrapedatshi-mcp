@@ -188,11 +188,51 @@ Once set, Claude will automatically use these keys without asking you to type th
 
 ---
 
+## Fetch Mode
+
+Starting in v0.5.0, the MCP server uses **local-fetch mode by default** — URLs are fetched on the machine running Claude Desktop (your IP), and only the HTML processing runs on our server. This is cheaper and keeps your IP off our server.
+
+### `SCRAPEDATSHI_FETCH_MODE=local` (default)
+
+The MCP server fetches URLs using the machine's own IP address, then submits the raw HTML to our server for processing.
+
+- ✅ Your IP is used — not our server's
+- ✅ Billed at the standard per-URL rate ($0.0020)
+- ✅ Faster — no double-hop latency
+
+### `SCRAPEDATSHI_FETCH_MODE=server`
+
+Our server fetches the URL. Use this if Claude Desktop is running in a restricted environment without outbound HTTP access, or if you need server-managed IP rotation.
+
+- ⚠️ Our server's IP is used
+- ⚠️ Billed at 2× the standard rate ($0.0040 / URL)
+- ✅ Works from restricted environments
+
+To enable server fetch, add `SCRAPEDATSHI_FETCH_MODE` to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "scrapedatshi": {
+      "command": "uvx",
+      "args": ["--from", "scrapedatshi-mcp[all]", "--refresh", "scrapedatshi-mcp"],
+      "env": {
+        "SCRAPEDATSHI_API_KEY": "sds_your_key_here",
+        "SCRAPEDATSHI_FETCH_MODE": "server"
+      }
+    }
+  }
+}
+```
+
+---
+
 ## Supported environment variables
 
 | Variable | Used for |
 |---|---|
 | `SCRAPEDATSHI_API_KEY` | scrapedatshi API key (**required**) |
+| `SCRAPEDATSHI_FETCH_MODE` | `local` (default) or `server` — see Fetch Mode above |
 | `OPENAI_API_KEY` | OpenAI LLM + embedding |
 | `ANTHROPIC_API_KEY` | Anthropic LLM (Claude) |
 | `GEMINI_API_KEY` | Google Gemini LLM + embedding |
@@ -303,6 +343,18 @@ Claude calls `list_vector_db_providers` and returns the required and optional fi
 - Every tool response includes `credits_used` and `credits_remaining`
 - LLM, embedding, and vector DB costs are billed directly by your chosen providers — scrapedatshi only charges for scraping and orchestration
 - Top up at [scrapedatshi.com/portal/billing](https://scrapedatshi.com/portal/billing)
+
+### Per-URL rates
+
+| Mode | Rate | When |
+|---|---|---|
+| Local fetch (default) | $0.0020 / URL | `SCRAPEDATSHI_FETCH_MODE=local` (default) |
+| Server fetch | $0.0040 / URL | `SCRAPEDATSHI_FETCH_MODE=server` |
+| Spider crawl (server) | $0.0050 / URL | `/v1/spider` — server-side link-following |
+| Chunk fee | $0.0005 / chunk | All routes |
+| Injection fee | $0.0030 / chunk | sync_to_vectordb, ingest_file, autorag |
+| Contextual Retrieval | $0.0010 / chunk | When `contextual_retrieval=true` |
+| Vector query | $0.0002 / chunk | query_vectordb, rag_chat |
 
 ---
 
