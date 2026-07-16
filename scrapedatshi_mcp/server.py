@@ -1119,6 +1119,10 @@ async def list_tools() -> list[types.Tool]:
                 "(.py, .js, .ts, .jsx, .tsx, .sql, .go, .rb, .java, .cs, .cpp, .c, .rs, .php,\n"
                 ".sh, .bash, .zsh, .r, .swift, .kt, .scala)\n"
                 "Maximum file size: 50 MB\n\n"
+                "CODE-AWARE CHUNKING: .py files are split by top-level class and function using "
+                "Python's AST parser — each class/function becomes its own chunk with imports "
+                "prepended for context. .sql files are split by statement block (CREATE TABLE, "
+                "INSERT INTO, SELECT, etc.). Both fall back to plain text if parsing fails.\n\n"
                 "FETCH MODE: By default (local-fetch mode), the file is parsed on the "
                 "user's machine using their own CPU — no heavy PDF processing on the server. "
                 "The extracted text is sent to the server for chunking only. "
@@ -1144,7 +1148,16 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to the local file to chunk. Supported: .pdf, .md, .txt, .yaml, .yml, .json. Example: 'C:/Users/user/Documents/report.pdf'",
+                        "description": (
+                            "Absolute path to the local file to chunk. "
+                            "Supported: .pdf, .md, .txt, .yaml, .yml, .json, .csv, .xlsx, .xls, "
+                            ".docx, .ipynb, .html, .htm, .xml, .toml, .ini, .cfg, "
+                            ".py (AST-aware: split by class/function), "
+                            ".sql (statement-aware: split by CREATE/INSERT/SELECT blocks), "
+                            ".js, .ts, .jsx, .tsx, .go, .rb, .java, .cs, .cpp, .c, .rs, .php, "
+                            ".sh, .bash, .zsh, .r, .swift, .kt, .scala. "
+                            "Example: 'C:/Users/user/Documents/report.pdf'"
+                        ),
                     },
                     "chunk_size": {
                         "type": "integer",
