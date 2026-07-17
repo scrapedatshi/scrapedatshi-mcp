@@ -288,6 +288,37 @@ Claude will call `crawl_site` with:
 - `allow_subdomains: true`: credentials are shared with subdomains of the root domain (e.g. `wiki.company.com` when root is `company.com`). Multi-part TLDs (`.co.uk`, `.com.br`) are handled safely.
 - Credentials are **never forwarded to the scrapedatshi server** — they stay on the machine running Claude Desktop
 
+### Enterprise SSO / MFA — Session Capture (v0.6.4+)
+
+For enterprise portals protected by Okta, Duo, or any SSO/MFA flow that blocks automated login, use the SDK's `capture_session()` utility to authenticate manually in a real browser, then pass the captured session state to Claude via the `storage_state` parameter.
+
+**Step 1 — Capture the session locally (run once):**
+
+```bash
+pip install scrapedatshi[auth]
+playwright install chromium
+```
+
+```python
+from scrapedatshi.auth import capture_session
+import json
+
+state = capture_session(
+    "https://internal.company.com/login",
+    save_to="session.auth.json",   # gitignored automatically
+)
+```
+
+This opens a real browser window. Log in manually (including any MFA prompts), then press Enter. The session state is saved to `session.auth.json`.
+
+**Step 2 — Tell Claude to use the saved session:**
+
+> *"Crawl https://internal.company.com using the session state in session.auth.json"*
+
+Claude will call `crawl_site` with the `storage_state` parameter containing the captured session.
+
+> **⚠ Security:** `session.auth.json` contains live authentication tokens. Never commit it to version control. The SDK's `.gitignore` template automatically filters `*.auth.json` files.
+
 ---
 
 ## Example conversations
